@@ -74,6 +74,15 @@ static int	PQsendQueryGuts(PGconn *conn,
 							const int *paramLengths,
 							const int *paramFormats,
 							int resultFormat);
+static int	PQsendQueryGuts2(PGconn *conn,
+							const char *command,
+							const char *stmtName,
+							int nParams,
+							const Oid *paramTypes,
+							const char *const *paramValues,
+							const int *paramLengths,
+							const int *paramFormats,
+							int resultFormat);
 static void parseInput(PGconn *conn);
 static PGresult *getCopyResult(PGconn *conn, ExecStatusType copytype);
 static bool PQexecStart(PGconn *conn);
@@ -1525,6 +1534,43 @@ PQsendQueryParams(PGconn *conn,
 						   resultFormat);
 }
 
+int
+PQsendQueryParams2(PGconn *conn,
+				  const char *command,
+				  int nParams,
+				  const Oid *paramTypes,
+				  const char *const *paramValues,
+				  const int *paramLengths,
+				  const int *paramFormats,
+				  int resultFormat)
+{
+	if (!PQsendQueryStart(conn, true))
+		return 0;
+
+	/* check the arguments */
+	if (!command)
+	{
+		libpq_append_conn_error(conn, "command string is a null pointer");
+		return 0;
+	}
+	if (nParams < 0 || nParams > PQ_QUERY_PARAM_MAX_LIMIT)
+	{
+		libpq_append_conn_error(conn, "number of parameters must be between 0 and %d",
+								PQ_QUERY_PARAM_MAX_LIMIT);
+		return 0;
+	}
+
+	return PQsendQueryGuts2(conn,
+						   command,
+						   "",	/* use unnamed statement */
+						   nParams,
+						   paramTypes,
+						   paramValues,
+						   paramLengths,
+						   paramFormats,
+						   resultFormat);
+}
+
 /*
  * PQsendPrepare
  *	 Submit a Parse message, but don't wait for it to finish
@@ -1801,6 +1847,174 @@ PQsendQueryGuts(PGconn *conn,
 		}
 		if (pqPutMsgEnd(conn) < 0)
 			goto sendFailed;
+	}
+
+	/* Construct the Bind message */
+	if (pqPutMsgStart(PqMsg_Bind, conn) < 0 ||
+		pqPuts("", conn) < 0 ||
+		pqPuts(stmtName, conn) < 0)
+		goto sendFailed;
+
+	/* Send parameter formats */
+	if (nParams > 0 && paramFormats)
+	{
+		if (pqPutInt(nParams, 2, conn) < 0)
+			goto sendFailed;
+		for (i = 0; i < nParams; i++)
+		{
+			if (pqPutInt(paramFormats[i], 2, conn) < 0)
+				goto sendFailed;
+		}
+	}
+	else
+	{
+		if (pqPutInt(0, 2, conn) < 0)
+			goto sendFailed;
+	}
+
+	if (pqPutInt(nParams, 2, conn) < 0)
+		goto sendFailed;
+
+	/* Send parameters */
+	for (i = 0; i < nParams; i++)
+	{
+		if (paramValues && paramValues[i])
+		{
+			int			nbytes;
+
+			if (paramFormats && paramFormats[i] != 0)
+			{
+				/* binary parameter */
+				if (paramLengths)
+					nbytes = paramLengths[i];
+				else
+				{
+					libpq_append_conn_error(conn, "length must be given for binary parameter");
+					goto sendFailed;
+				}
+			}
+			else
+			{
+				/* text parameter, do not use paramLengths */
+				nbytes = strlen(paramValues[i]);
+			}
+			if (pqPutInt(nbytes, 4, conn) < 0 ||
+				pqPutnchar(paramValues[i], nbytes, conn) < 0)
+				goto sendFailed;
+		}
+		else
+		{
+			/* take the param as NULL */
+			if (pqPutInt(-1, 4, conn) < 0)
+				goto sendFailed;
+		}
+	}
+	if (pqPutInt(1, 2, conn) < 0 ||
+		pqPutInt(resultFormat, 2, conn))
+		goto sendFailed;
+	if (pqPutMsgEnd(conn) < 0)
+		goto sendFailed;
+
+	/* construct the Describe Portal message */
+	if (pqPutMsgStart(PqMsg_Describe, conn) < 0 ||
+		pqPutc('P', conn) < 0 ||
+		pqPuts("", conn) < 0 ||
+		pqPutMsgEnd(conn) < 0)
+		goto sendFailed;
+
+	/* construct the Execute message */
+	if (pqPutMsgStart(PqMsg_Execute, conn) < 0 ||
+		pqPuts("", conn) < 0 ||
+		pqPutInt(0, 4, conn) < 0 ||
+		pqPutMsgEnd(conn) < 0)
+		goto sendFailed;
+
+	/* construct the Sync message if not in pipeline mode */
+	if (conn->pipelineStatus == PQ_PIPELINE_OFF)
+	{
+		if (pqPutMsgStart(PqMsg_Sync, conn) < 0 ||
+			pqPutMsgEnd(conn) < 0)
+			goto sendFailed;
+	}
+
+	/* remember we are using extended query protocol */
+	entry->queryclass = PGQUERY_EXTENDED;
+
+	/* and remember the query text too, if possible */
+	/* if insufficient memory, query just winds up NULL */
+	if (command)
+		entry->query = strdup(command);
+
+	/*
+	 * Give the data a push (in pipeline mode, only if we're past the size
+	 * threshold).  In nonblock mode, don't complain if we're unable to send
+	 * it all; PQgetResult() will do any additional flushing needed.
+	 */
+	if (pqPipelineFlush(conn) < 0)
+		goto sendFailed;
+
+	/* OK, it's launched! */
+	pqAppendCmdQueueEntry(conn, entry);
+
+	return 1;
+
+sendFailed:
+	pqRecycleCmdQueueEntry(conn, entry);
+	/* error message should be set up already */
+	return 0;
+}
+
+static int
+PQsendQueryGuts2(PGconn *conn,
+				const char *command,
+				const char *stmtName,
+				int nParams,
+				const Oid *paramTypes,
+				const char *const *paramValues,
+				const int *paramLengths,
+				const int *paramFormats,
+				int resultFormat)
+{
+	int			i;
+	PGcmdQueueEntry *entry;
+
+	entry = pqAllocCmdQueueEntry(conn);
+	if (entry == NULL)
+		return 0;				/* error msg already set */
+
+	/*
+	 * We will send Parse (if needed), Bind, Describe Portal, Execute, Sync
+	 * (if not in pipeline mode), using specified statement name and the
+	 * unnamed portal.
+	 */
+
+	if (command)
+	{
+		/* construct the Parse message */
+		if (pqPutMsgStart(PqMsg_Parse, conn) < 0 ||
+			pqPuts(stmtName, conn) < 0 ||
+			pqPuts(command, conn) < 0)
+			goto sendFailed;
+		if (nParams > 0 && paramTypes)
+		{
+			if (pqPutInt(nParams, 2, conn) < 0)
+				goto sendFailed;
+			for (i = 0; i < nParams; i++)
+			{
+				if (pqPutInt(paramTypes[i], 4, conn) < 0)
+					goto sendFailed;
+			}
+		}
+		else
+		{
+			if (pqPutInt(0, 2, conn) < 0)
+				goto sendFailed;
+		}
+		if (pqPutMsgEnd(conn) < 0)
+			goto sendFailed;
+
+		if (pqPipelineFlush(conn) < 0)
+		  goto sendFailed;
 	}
 
 	/* Construct the Bind message */
@@ -2285,6 +2499,25 @@ PQexecParams(PGconn *conn,
 	if (!PQexecStart(conn))
 		return NULL;
 	if (!PQsendQueryParams(conn, command,
+						   nParams, paramTypes, paramValues, paramLengths,
+						   paramFormats, resultFormat))
+		return NULL;
+	return PQexecFinish(conn);
+}
+
+PGresult *
+PQexecParams2(PGconn *conn,
+			 const char *command,
+			 int nParams,
+			 const Oid *paramTypes,
+			 const char *const *paramValues,
+			 const int *paramLengths,
+			 const int *paramFormats,
+			 int resultFormat)
+{
+	if (!PQexecStart(conn))
+		return NULL;
+	if (!PQsendQueryParams2(conn, command,
 						   nParams, paramTypes, paramValues, paramLengths,
 						   paramFormats, resultFormat))
 		return NULL;

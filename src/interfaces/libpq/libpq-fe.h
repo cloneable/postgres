@@ -481,6 +481,14 @@ extern PGresult *PQexecParams(PGconn *conn,
 							  const int *paramLengths,
 							  const int *paramFormats,
 							  int resultFormat);
+extern PGresult *PQexecParams2(PGconn *conn,
+							  const char *command,
+							  int nParams,
+							  const Oid *paramTypes,
+							  const char *const *paramValues,
+							  const int *paramLengths,
+							  const int *paramFormats,
+							  int resultFormat);
 extern PGresult *PQprepare(PGconn *conn, const char *stmtName,
 						   const char *query, int nParams,
 						   const Oid *paramTypes);
@@ -497,6 +505,14 @@ extern PGresult *PQexecPrepared(PGconn *conn,
 
 extern int	PQsendQuery(PGconn *conn, const char *query);
 extern int	PQsendQueryParams(PGconn *conn,
+							  const char *command,
+							  int nParams,
+							  const Oid *paramTypes,
+							  const char *const *paramValues,
+							  const int *paramLengths,
+							  const int *paramFormats,
+							  int resultFormat);
+extern int	PQsendQueryParams2(PGconn *conn,
 							  const char *command,
 							  int nParams,
 							  const Oid *paramTypes,
